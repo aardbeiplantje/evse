@@ -16,7 +16,7 @@ die usage() unless $tcpdump_fn and -e $tcpdump_fn;
 #   -R '(tcp.stream eq 3 and websocket || http)'
 #
 
-open(my $t_fh, "tshark -r $tcpdump_fn -X lua_script:$where/ws.lua -T fields -e bcencrypt.hex|")
+open(my $t_fh, "tshark -r $tcpdump_fn -X lua_script:$where/ws.lua -T fields -e bcencrypt.hex 2>/dev/null|grep --line-buffered .|")
     or die "Error opening tshark: $!\n";
 my @p;
 while(my $l = <$t_fh>){
@@ -51,7 +51,7 @@ die usage() unless @p;
 
 my $msg;
 foreach my $data (@p){
-    #print STDERR $data =~ s/(.)/sprintf("%02X",ord($1))/gesmr, "\n";
+    print STDERR $data =~ s/(.)/sprintf("%02X",ord($1))/gesmr, "\n";
 }
 $msg = $_ for grep {length($_) == 265} @p;
 
