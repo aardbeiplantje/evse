@@ -143,6 +143,7 @@ my $sz_msg_decode_map = {
 };
 
 # find the XOR key
+$msg //= "";
 print STDERR "MSG[L:".length($msg)."]:".($msg =~ s/./sprintf("%02X",ord($&))/gesmr)."\n";
 my $s_key8;
 $s_key8 //= get_key($msg, $sz_msg_decode_map->{length($msg)});
@@ -212,7 +213,7 @@ sub get_key {
 
         $kk[$i] //= bb($w, $kt->[0], $kt->[1]);
     }
-    return pack("C*",@kk);
+    return pack("C*",map {$_//0} @kk);
 }
 
 sub xor_msg {
