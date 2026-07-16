@@ -20,4 +20,4 @@ tshark -r "$sfn" -2 -R \
     -e text \
     -e _ws.col.Info \
     -e bcencrypt.command \
-    |awk -F'\t' '{print $6}'|jq -cr
+    |awk -F'\t' '{print $6}'
