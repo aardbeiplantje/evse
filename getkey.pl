@@ -2,7 +2,7 @@
 
 use strict; use warnings;
 
-use JSON;
+use JSON::PP 'decode_json';
 use FindBin;
 
 my $where = $FindBin::Bin;
@@ -28,6 +28,19 @@ while(my $l = <$t_fh>){
 
 # do we have data?
 die usage("[INFO] no packets in dump decoded by ws.lua") unless @p;
+
+# detect plaintext mode: try to decode first message as JSON
+my $plaintext_mode;
+my $first_msg = $p[0] // "";
+my $check;
+eval { $check = decode_json($first_msg); };
+if($@){
+    # Not valid JSON - encrypted mode (XOR)
+    $plaintext_mode = 0;
+}else{
+    # Successfully decoded as JSON - plaintext mode
+    $plaintext_mode = 1;
+}
 
 #
 # Look for a message with 124 bytes, like this:
@@ -142,7 +155,16 @@ my $sz_msg_decode_map = {
     28  => $boot_msg,
 };
 
-# find the XOR key
+# find the XOR key or handle plaintext
+if($plaintext_mode){
+    # Plain text - just print messages as-is
+    foreach my $m (@p){
+        print "$m\n";
+    }
+    print "\n[NO ENCRYPTION - plaintext JSON]\n";
+    exit;
+}
+
 $msg //= "";
 print STDERR "MSG[L:".length($msg)."]:".($msg =~ s/./sprintf("%02X",ord($&))/gesmr)."\n";
 my $s_key8;
@@ -153,7 +175,7 @@ REDO:
     eval {
         die "No key found\n" unless $s_key8;
         $decoded_msg = xor_msg($s_key8, $msg);
-        my $j_msg = JSON::decode_json($decoded_msg);
+        my $j_msg = decode_json($decoded_msg);
         print STDERR "DECODED: $decoded_msg\n";
     };
     if($@){
