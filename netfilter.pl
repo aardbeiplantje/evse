@@ -319,11 +319,13 @@ sub handle_ip_data {
         logger::debug("got data, size:".length($masked_data));
         if($opcode == 0x08){
             logger::debug("close frame");
-            if(length($masked_data)){
+            if(length($masked_data) >= 2){
                 my $close_code = unpack("S>", substr($masked_data, 0, 2, ''));
                 logger::debug("close_code: $close_code");
                 my $close_reason = substr($masked_data, 0, length($masked_data), '');
                 logger::debug("close_reason: $close_reason");
+            } elsif(length($masked_data)){
+                logger::debug("close frame, short data: ".length($masked_data)." bytes");
             }
             $$wsbuf = "";
             last;
