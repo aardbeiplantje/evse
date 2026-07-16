@@ -20,8 +20,11 @@ use File::Path qw(mkpath);
 use FindBin;
 
 use utils::netlink;
+use utils::ip_packet;
+use utils::pcap;
 
-my $st = {};
+my $sf = {};
+my $st = \($sf->{_nf_state} //= {});
 open(my $rfh, '<', $input_file) or die $!;
 while(1){
     local $/ = "\n";
@@ -30,47 +33,31 @@ while(1){
     my $r = read($rfh, my $payload, $1)
         // die $!;
     last if $r == 0;
-    handle_data($st, $payload);
+    handle_frame($sf, $st, \$payload);
 }
 
-sub handle_data {
-    my ($self, $data) = @_;
-    return unless length($data//"");
-    # process the netlink/netfilter/queue message
-    eval {
-        my $st = \($self->{_nf_state} //= {});
-        logger::info("handling data:", to_hex($data));
-        netlink::handle_nlmsg(\$data, sub {
-            my ($ip_pkt_ref, $pkt_id, $m_seq) = @_;
+sub handle_frame {
+    my ($self, $st, $ip_pkt_ref) = @_;
+    my $p_data = ip_packet::decode($ip_pkt_ref);
+    logger::info("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
+    # process IP packet data
+    handle_ip_data($st, $p_data, sub {
+        my ($buffer_ref) = @_;
+        # valid HTTP/WebSocket data
+        if($xor_key){
+            # XOR decode
+            logger::debug("xor_key: $xor_key");
+            my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
+            logger::info("decoded_msg: $decoded_msg");
 
-            # process IP packet
-            my $p_data = ip_packet::decode($ip_pkt_ref);
-            logger::info("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
-
-            # process IP packet data
-            handle_ip_data($st, $p_data, sub {
-                my ($buffer_ref) = @_;
-                # valid HTTP/WebSocket data
-                if($xor_key){
-                    # XOR decode
-                    logger::debug("xor_key: $xor_key");
-                    my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
-                    logger::info("decoded_msg: $decoded_msg");
-
-                    # JSON Parse
-                    $self->ocpp_msg_process($decoded_msg);
-                } else {
-                    logger::info("ocpp msg: $$buffer_ref");
-                    $self->ocpp_msg_process($$buffer_ref);
-                }
-                return;
-            });
-        });
-    };
-    if($@){
-        logger::log_error("problem handling data: $@");
-    }
-    return;
+            # JSON Parse
+            ocpp_msg_process($self, $decoded_msg);
+        } else {
+            logger::info("ocpp msg: $$buffer_ref");
+            ocpp_msg_process($self, $$buffer_ref);
+        }
+        return;
+    });
 }
 
 sub log_data {
