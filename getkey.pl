@@ -64,7 +64,7 @@ if($@){
 
 my $msg;
 foreach my $data (@p){
-    print STDERR $data =~ s/(.)/sprintf("%02X",ord($1))/gesmr, "\n";
+    #print STDERR $data =~ s/(.)/sprintf("%02X",ord($1))/gesmr, "\n";
 }
 $msg = $_ for grep {length($_) == 265} @p;
 
@@ -161,7 +161,7 @@ if($plaintext_mode){
     foreach my $m (@p){
         print "$m\n";
     }
-    print "\n[NO ENCRYPTION - plaintext JSON]\n";
+    print STDERR "\n[NO ENCRYPTION - plaintext JSON]\n";
     exit;
 }
 
