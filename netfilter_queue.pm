@@ -1,17 +1,11 @@
-#!/usr/bin/perl
+package sensor::netfilter_queue;
 
-use strict;
+# This sensor is a netfilter queue sensor
+# use strict doesn't work, inheritance breaks, TODO: verify
+## no critic (RequireUseStrict, RequireUseWarnings)
+#use strict;
 use warnings;
-
-use FindBin;
-use JSON::PP;
-
-my $xor_key = $ENV{XOR_KEY};
-my $where = $FindBin::Bin;
-
-# Determine input mode: pcap/tcpdump or trace (L:<LEN>\n<DATA>)
-my $input_file = $ARGV[0] // $ENV{NF_PKT_TRACE} // die "usage: $0 <file>";
-my $nf_input   = $ENV{NF_INPUT} // 'pcap';  # 'pcap' (default) or 'trace'
+use base qw(sensor);
 
 use Socket qw(AF_INET SOCK_RAW);
 use POSIX ();
@@ -20,104 +14,146 @@ use File::Basename qw(dirname);
 use File::Path qw(mkpath);
 use FindBin;
 
-use utils::netlink;
+use utils::netlink qw(AF_NETLINK NETLINK_NETFILTER NF_ACCEPT SOL_NETLINK NETLINK_EXT_ACK NETLINK_CAP_ACK NETLINK_NO_ENOBUFS);
 use utils::ip_packet;
-use utils::pcap;
+use utils::metrics;
 
-my $sf = {};
-my $st = \($sf->{_nf_state} //= {});
+sub sensor_init {
+    my ($self) = @_;
+    delete $self->{_socket};
+    delete $self->{_fd};
+    delete $self->{_bind_addr};
+    $self->{_outbuffer} = "";
 
-if($nf_input eq 'trace') {
-    # trace format: L:<LENGTH>\n<DATA> per packet
-    open(my $rfh, '<', $input_file) or die $!;
-    while(1){
-        local $/ = "\n";
-        my $h_msg = <$rfh>;
-        last unless ($h_msg//"") =~ m/^L:(\d+)\n/;
-        my $r = read($rfh, my $payload, $1)
-            // die $!;
-        last if $r == 0;
-        handle_frame($sf, $st, \$payload);
-    }
-    close($rfh);
+    my $queue_num = $self->{cfg}{l}{nf_queue_num} // $self->{cfg}{b} // 121;
+    logger::log_info("queue_num: $queue_num");
+    my $my_id = 0;#$$;
+    my $bind_addr = pack("SSLL", AF_NETLINK, 0, $my_id, 0);
+    my $nf_fh;
+    logger::log_info("doing as root $< $> $( $)");
+    utils::sudo_su_root(sub {
+        logger::log_info("as root? $< $> $( $)");
+        socket($nf_fh, AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER)
+            // die "socket: $!";
+        bind($nf_fh, $bind_addr)
+            // die "bind: $!";
+        binmode($nf_fh);
+        my $s_flags = fcntl($nf_fh, F_GETFL, 0)
+            or die "Can't get flags for the socket: $!";
+        fcntl($nf_fh, F_SETFL, $s_flags|O_NONBLOCK)
+            or die "Can't set flags for the socket: $!";
+        setsockopt($nf_fh, SOL_NETLINK, NETLINK_EXT_ACK, 0)
+            or die "setsockopt: $!";
+        setsockopt($nf_fh, SOL_NETLINK, NETLINK_CAP_ACK, 0)
+            or die "setsockopt: $!";
+        setsockopt($nf_fh, SOL_NETLINK, NETLINK_NO_ENOBUFS, 1)
+            or die "setsockopt: $!";
+    });
+    logger::log_info("drop privileges back $< $> $( $)");
 
-} else {
-    # pcap/tcpdump format: stream-read, advance file pointer
-    # PCAP global header is 24 bytes; detect byte order from magic number
-    # then each record is 16-byte hdr + incl_len bytes of packet data
-    open(my $pfh, '<:raw', $input_file) or die $!;
+    $self->{_bind_addr} = $bind_addr;
+    $self->{_socket} = $nf_fh;
+    $self->{_fd}     = fileno($nf_fh);
 
-    # Read global header (24 bytes) once
-    my $ghdr;
-    read($pfh, $ghdr, 24) or die "pcap: short global header";
+    # register for packets from the queue, $queue_num
+    my $f_req = '';
+    $f_req .= netlink::nfqnl_bind(AF_INET, $queue_num);
+    $f_req .= netlink::nfqnl_copy_packet($queue_num, 0xffff); # full size copy
+    $self->{_outbuffer} = $f_req;
 
-    # Detect byte order from pcap magic: 0xa1b2c3d4 = native, 0xd4c3b2a1 = swapped
-    my $magic = unpack("V", $ghdr);  # little-endian probe
-    my $be    = ($magic == 0xd4c3b2a1) ? 1 : 0;  # 1 => big-endian fields
-    my $fmt   = $be ? "NNNN" : "LLLL";
-
-    # Stream through pcap records
-    while(1) {
-        # Record header: ts_sec(4) ts_usec(4) incl_len(4) orig_len(4)
-        my $rec_hdr;
-        my $r = read($pfh, $rec_hdr, 16);
-        last unless defined $r && $r == 16;
-        my ($ts_sec, $ts_usec, $incl_len, $orig_len) = unpack($fmt, $rec_hdr);
-
-        # incl_len includes Ethernet header (14 bytes);
-        # read full frame data so pointer advances regardless of type
-        my $ethhdr;
-        my $frame_data;
-        my $data_len = $incl_len;
-        $r = read($pfh, $ethhdr, 14);
-        last unless defined $r && $r == 14;
-        my ($eth_dst, $eth_src, $eth_type) = unpack("a6a6S>", $ethhdr);
-
-        # skip non-IPv4 packets by reading their data and moving on
-        if ($eth_type != 0x0800) {
-            $r = read($pfh, $frame_data, $data_len - 14);
-            last unless defined $r && $r == ($data_len - 14);
-            next;
-        }
-
-        my $ip_len = $incl_len - 14;
-        my $ip_data;
-        $r = read($pfh, $ip_data, $ip_len);
-        last unless defined $r && $r == $ip_len;
-
-        handle_frame($sf, $st, \$ip_data);
-    }
-    close($pfh);
+    return $self->{_fd};
 }
 
-sub handle_frame {
-    my ($self, $st, $ip_pkt_ref) = @_;
-    my $p_data = ip_packet::decode($ip_pkt_ref);
-    logger::debug("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
-    # process IP packet data
-    handle_ip_data($st, $p_data, sub {
-        my ($buffer_ref) = @_;
-        # valid HTTP/WebSocket data
-        if($xor_key){
-            # XOR decode
-            logger::debug("xor_key: $xor_key");
-            my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
-            logger::debug("decoded_msg: $decoded_msg");
+sub sensor_stop {
+    my ($self) = @_;
+    close($self->{_socket}) if defined $self->{_socket};
+    delete $self->{_socket};
+    delete $self->{_fd};
+    return;
+}
 
-            # JSON Parse
-            ocpp_msg_process($self, $decoded_msg);
-        } else {
-            logger::debug("ocpp msg: $$buffer_ref");
-            ocpp_msg_process($self, $$buffer_ref);
-        }
-        return;
-    });
+sub need_write {
+    my ($self) = @_;
+    return 1 if length($self->{_outbuffer});
+    return 0;
+}
+
+sub handle_data {
+    my ($self, $data) = @_;
+    return unless length($data//"");
+    # process the netlink/netfilter/queue message
+    my $xor_key = $self->{cfg}{l}{xor_key};
+    eval {
+        my $st = \($self->{_nf_state} //= {});
+        my $queue_num = $self->{cfg}{l}{nf_queue_num} // $self->{cfg}{b} // 121;
+        logger::info("handling data from queue $queue_num:", to_hex($data));
+        netlink::handle_nlmsg(\$data, sub {
+            my ($ip_pkt_ref, $pkt_id, $m_seq) = @_;
+
+            # always a positive verdict ACCEPT
+            logger::info("sending verdict ACCEPT for packet $pkt_id, $m_seq, queue: $queue_num, id: 0");
+            $self->{_outbuffer} .= netlink::nfqnl_msg_verdict($m_seq, 0, $queue_num, $pkt_id, NF_ACCEPT());
+            $self->do_write();
+
+            # process IP packet
+            my $p_data = ip_packet::decode($ip_pkt_ref);
+            logger::info("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
+
+            # process IP packet data
+            handle_ip_data($st, $p_data, sub {
+                my ($buffer_ref) = @_;
+                # valid HTTP/WebSocket data
+                if($xor_key){
+                    # XOR decode
+                    logger::debug("xor_key: $xor_key");
+                    my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
+                    logger::info("decoded_msg: $decoded_msg");
+
+                    # JSON Parse
+                    $self->ocpp_msg_process($decoded_msg);
+                } else {
+                    logger::info("ocpp msg: $$buffer_ref");
+                    $self->ocpp_msg_process($$buffer_ref);
+                }
+                return;
+            });
+        });
+    };
+    if($@){
+        logger::log_error("problem handling data: $@");
+    }
+    return;
 }
 
 sub log_data {
     my ($self, $msg) = @_;
-    open(my $of, '>>', '&STDOUT');
+    my $kv  = $self->{cfg}{k};
+    my $bd  = $self->{cfg}{l}{data_dir}
+        // utils::cfg("VARDIR", "/var/metrics");
+    my $ofn = $self->{cfg}{l}{output}
+        // POSIX::strftime("${bd}/${kv}/snoop_${kv}_%F.log", gmtime());
+    my $of = do {
+        local $!;
+        my $bbd = dirname($ofn);
+        if($bbd){
+            eval {mkpath($bbd)};
+            if($@){
+                logger::error("problem creating dir $bbd: $@");
+            }
+        }
+        my $_ofh;
+        if(!open($_ofh, '>>', $ofn)){
+            logger::error("problem opening $ofn: $!");
+            open($_ofh, '>>', '&STDOUT') or
+            open($_ofh, '>>', '/dev/null');
+        }
+        $_ofh;
+    };
     print {$of} $msg."\n";
+    close($of) or do {
+        logger::error("problem closing $ofn: $!");
+        print $msg."\n";
+    };
     return;
 }
 
@@ -171,16 +207,18 @@ sub ocpp_msg_process {
 
         # make audit log
         if(defined $meter_value){
-            print "$msg,$meter_value\n";
+            $self->log_data("$msg,$meter_value");
         } else {
-            print "$msg\n";
+            $self->log_data($msg);
         }
 
         # cool charging bool flag per idTag
         eval {
             my $idTag = $ocpp_msg->[3]{idTag};
             if      ($ocpp_msg->[2] eq "StartTransaction"){
+                metrics::log_metric("blinkcharging:$self->{cfg}{k}:$idTag:charging,1");
             } elsif ($ocpp_msg->[2] eq "StopTransaction"){
+                metrics::log_metric("blinkcharging:$self->{cfg}{k}:$idTag:charging,0");
             }
         };
         if($@){
@@ -195,10 +233,9 @@ sub ocpp_msg_process {
 
 sub handle_ip_data {
     my ($state, $pkt, $h_sub) = @_;
-    logger::debug("handle payload?");
     return unless defined $pkt and defined $pkt->{conn};
     my $_st = $$state //= {};
-    logger::debug("handle payload: yes");
+    logger::debug("handle payload");
 
     my $conn_k1 = join(",", @{$pkt->{conn}});
     my $conn_k2 = join(",", reverse @{$pkt->{conn}});
@@ -368,6 +405,46 @@ sub handle_ip_data {
     return;
 }
 
+sub do_write {
+    my ($self) = @_;
+    return unless defined $self->{_outbuffer};
+    my $n = length($self->{_outbuffer});
+    logger::debug(">>WRITE>>$n>>".join('', map {sprintf '%04X', ord} split //, $self->{_outbuffer}));
+    utils::sudo_su_root(sub {
+        local $!;
+        my $r = send($self->{_socket}, $self->{_outbuffer}, 0, $self->{_bind_addr});
+        if($!){
+            return if $!{EINTR} or $!{EAGAIN};
+            die "problem writing data [fd:$self->{_fd}]: $!\n";
+        }
+        $self->{_outbuffer} = "";
+    });
+    return;
+}
+
+sub do_read {
+    my ($self) = @_;
+    no warnings 'once';
+    while($::METRICS::LOOP){
+        # read
+        my $pkt_msg;
+        my ($r) = utils::sudo_su_root(sub {
+            local $!;
+            my $r = recv($self->{_socket}, $pkt_msg, 131072, 0);
+            if(!defined $r){
+                return 1 if $!{EINTR} or $!{EAGAIN};
+                die "problem reading data [fd:$self->{_fd},key:$self->{cfg}{k}]: $!\n";
+            }
+            return 0;
+        });
+        return 1 if $r;
+
+        # ok data, handle it
+        $self->handle_data($pkt_msg);
+    }
+    return 1;
+}
+
 sub to_hex {
     my $b = \$_[0];
     return join("",map {sprintf("%02x", ord $_)} split '', $$b//"");
@@ -379,74 +456,4 @@ sub xor_msg {
     return $m ^ $fs_key8;
 }
 
-# ===========================================================================
-# Inline logger - replaces utils::logger
-# ===========================================================================
-package logger;
-use strict;
-use warnings;
-
-no warnings 'redefine';
-
-our $_log_level;
-our $_logger_stderr;
-
-sub _cfg {
-    my ($k, $default) = @_;
-    my $env_m = "NETFILTER_" . uc($k);
-    my $env_a = "XOR_" . uc($k);
-    $ENV{$env_m} // $ENV{$env_a} // $default;
-}
-
-sub log_fatal {
-    my (@msg) = @_;
-    print STDERR "[FATAL] " . join(" ", @msg) . "\n";
-    die join(" ", @msg) . "\n";
-}
-
-sub log_error {
-    my (@msg) = @_;
-    return unless _cfg("logger_level", 'info') =~ /^(error|info|debug)$/
-                 || _cfg("DEBUG", 0);
-    print STDERR "[ERROR] " . join(" ", @msg) . "\n";
-}
-
-sub log_info {
-    my (@msg) = @_;
-    return unless _cfg("logger_level", 'info') =~ /^(info|debug)$/
-                 || _cfg("DEBUG", 0);
-    print STDERR "[INFO] " . join(" ", @msg) . "\n";
-}
-
-sub log_debug {
-    my (@msg) = @_;
-    return unless _cfg("logger_level", 'info') =~ /^(debug)$/
-                 || _cfg("DEBUG", 0);
-    no warnings 'once';
-    require Data::Dumper;
-    local $Data::Dumper::Sortkeys = 1;
-    local $Data::Dumper::Indent   = 0;
-    local $Data::Dumper::Terse    = 1;
-    local $Data::Dumper::Deepcopy = 1;
-    print STDERR "[DEBUG] " . join(" ", map {ref($_) ? Data::Dumper::Dumper($_) : $_} @msg) . "\n";
-}
-
-# Aliases used by original logger
-BEGIN { no warnings 'once'; *fatal = *log_fatal; *error = *log_error; *info = *log_info; *debug = *log_debug; }
-
-# ===========================================================================
-# Inline cfg - replaces utils::cfg
-# ===========================================================================
-package utils;
-use strict;
-use warnings;
-
-no warnings 'redefine';
-
-sub cfg {
-    my ($k, $default, $nm, $do_exception, $r) = @_;
-    my $env_m = uc("NETFILTER_$k");
-    my $env_a = uc("XOR_$k");
-    my $v = $ENV{$env_m} // $ENV{$env_a} // $default;
-    return $v;
-}
+1;
