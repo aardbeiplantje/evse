@@ -122,6 +122,8 @@ sub decode {
             $pkt->{data} = $payload;
         }
         $pkt->{tcp_flags} = $tcp_flags;
+        $pkt->{seq_num} = $tcp_seq;
+        $pkt->{is_tcp} = 1;
     } elsif($ipproto == 1) { # ICMP
         my $icmphdr = substr($$ip_pkt, 0, 8, '');
         # now we parse the icmp header

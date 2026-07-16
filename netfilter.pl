@@ -203,10 +203,10 @@ sub handle_ip_data {
     my $conn_k1 = join(",", @{$pkt->{conn}});
     my $conn_k2 = join(",", reverse @{$pkt->{conn}});
 
-    # if we get a TCP_FIN, we should close the connection and cleanup
+    # if we get a TCP_FIN or RST, close the connection and cleanup
     if(defined $pkt->{tcp_flags}){
-        if($pkt->{tcp_flags} & 0x01){
-            logger::debug("TCP_FIN for ".join(",", @{$pkt->{conn}}));
+        if($pkt->{tcp_flags} & 0x01 or $pkt->{tcp_flags} & 0x04){
+            logger::debug("TCP_FIN/RST for ".join(",", @{$pkt->{conn}}));
             delete $_st->{$conn_k1};
             delete $_st->{$conn_k2};
             return;
@@ -218,6 +218,21 @@ sub handle_ip_data {
             logger::debug("TCP_SYN for ".join(",", @{$pkt->{conn}}));
         }
     }
+
+    # skip non-TCP data
+    return unless $pkt->{is_tcp};
+
+    # skip TCP retransmissions (same seq_num + data length)
+    my $seq_key = defined $pkt->{seq_num}
+        ? join(":", $pkt->{seq_num}, length($pkt->{data}//""))
+        : "";
+    if($seq_key and defined $_st->{seen} and exists $_st->{seen}->{$seq_key}){
+        logger::debug("retransmission skipped seq=$seq_key");
+        return;
+    }
+    $_st->{seen} //= {};
+    $_st->{seen}->{$seq_key} = 1 if $seq_key;
+
     return unless defined $pkt and defined $pkt->{conn} and length($pkt->{data}//"");
     my $data_payload = $pkt->{data};
     my $st  =
