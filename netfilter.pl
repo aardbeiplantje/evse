@@ -98,17 +98,34 @@ sub handle_frame {
     handle_ip_data($st, $p_data, sub {
         my ($buffer_ref) = @_;
         # valid HTTP/WebSocket data
-        if($xor_key){
-            # XOR decode
-            logger::debug("xor_key: $xor_key");
-            my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
-            logger::debug("decoded_msg: $decoded_msg");
+        my $msg = $xor_key ? xor_msg($xor_key, $$buffer_ref) : $$buffer_ref;
 
+        # dedup on OCPP message content: [type, request_id, method]
+        # requests have method at [2], responses have result hash at [2]
+        my $dedup_key;
+        eval {
+            my $parsed = JSON::PP::decode_json($msg);
+            if(ref($parsed) eq 'ARRAY' and scalar(@$parsed) >= 3){
+                if($parsed->[0] eq "2" and defined $parsed->[2] and !ref($parsed->[2])){
+                    $dedup_key = join(":", $parsed->[0], $parsed->[1], $parsed->[2]);
+                } else {
+                    $dedup_key = join(":", $parsed->[0], $parsed->[1]);
+                }
+            }
+        };
+        if($dedup_key and exists $$st->{seen_msgs}->{$dedup_key}){
+            logger::debug("duplicate msg skipped: $dedup_key");
+            return;
+        }
+        $$st->{seen_msgs} //= {};
+        $$st->{seen_msgs}->{$dedup_key} = 1;
+
+        if($xor_key){
             # JSON Parse
-            ocpp_msg_process($self, $decoded_msg);
+            ocpp_msg_process($self, $msg);
         } else {
-            logger::debug("ocpp msg: $$buffer_ref");
-            ocpp_msg_process($self, $$buffer_ref);
+            logger::debug("ocpp msg: $msg");
+            ocpp_msg_process($self, $msg);
         }
         return;
     });
