@@ -102,7 +102,7 @@ sub handle_frame {
             # XOR decode
             logger::debug("xor_key: $xor_key");
             my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
-            logger::info("decoded_msg: $decoded_msg");
+            logger::debug("decoded_msg: $decoded_msg");
 
             # JSON Parse
             ocpp_msg_process($self, $decoded_msg);
