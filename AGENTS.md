@@ -10,6 +10,7 @@ This repo contains tools for analyzing OCPP 1.6j WebSocket traffic from EV charg
 ## Key Files
 
 - **`getkey.pl`** — Main script. Reads tshark output of `bcencrypt.hex`, detects encrypted vs plaintext mode (validates first frame as JSON), derives XOR key for encrypted data, or prints plaintext directly.
+- **`netfilter.pl`** — Reads OCPP WebSocket traffic from pcap/tcpdump files (via tshark) or trace files (L:<LEN>\n<DATA> format). Self-contained — no external Perl module dependencies.
 - **`ws.lua`** — Wireshark/TShark custom dissector. Uses a portable `bxor()` arithmetic function (compatible with Lua 5.1–5.4). Registers as heuristic on `ws.port 80`.
 - **`evse-ws-decrypt.sh`** — Decrypts and displays OCPP messages using a key file + `ws.lua`.
 - **`evse-report.pl`** — Generates charging transaction reports from snoop log files. Uses `JSON::PP`.
@@ -42,5 +43,6 @@ tshark -r <pcapfile> -Y "websocket" -T fields -e websocket.payload.text
 
 - `ws.lua`: replaced `~` operator with portable `bxor()` function (commit: `c8ec9e3`)
 - `getkey.pl`: added plaintext detection, switched to `JSON::PP`, quieted verbose debug output
+- `netfilter.pl`: inlined utils::logger and utils::cfg, removed external module deps, added pcap/tcpdump support
 - `README.md`: comprehensive docs added
 - `LICENSE`: UNLICENSE (public domain)
