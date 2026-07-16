@@ -2,6 +2,18 @@ require "string"
 
 local args = { ... }
 local tbl_xor_key = args[1]
+-- Portable XOR that works on all Lua versions (5.1+)
+local function bxor(a, b)
+    local result, bit = 0, 1
+    while a > 0 or b > 0 do
+        local ra, rb = a % 2, b % 2
+        if ra ~= rb then result = result + bit end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit = bit * 2
+    end
+    return result
+end
 local function xorf(data)
     local l = data:len()
     local d = {}
@@ -16,7 +28,7 @@ local function xorf(data)
       v = tbl_xor_key:byte(j)
       j = j +1
       --print("L:"..tostring(l)..",I:"..tostring(i)..",J:"..tostring(j)..",V:"..tostring(v))
-      s = string.format("%c", str:byte(i) ~ v)
+      s = string.format("%c", bxor(str:byte(i), v))
       table.insert(d, s)
     end
 
