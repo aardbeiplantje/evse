@@ -9,7 +9,7 @@ my $where = $FindBin::Bin;
 
 # do we have a file?
 my $tcpdump_fn = shift @ARGV;
-die usage() unless $tcpdump_fn and -e $tcpdump_fn;
+die usage("[ERROR] need dump file") unless $tcpdump_fn and -e $tcpdump_fn;
 
 # read in tcpdump streams, in hex, add extra filters if needed:
 #
@@ -27,7 +27,7 @@ while(my $l = <$t_fh>){
 }
 
 # do we have data?
-die usage() unless @p;
+die usage("[INFO] no packets in dump decoded by ws.lua") unless @p;
 
 #
 # Look for a message with 124 bytes, like this:
@@ -177,7 +177,9 @@ exit;
 # FUNCTIONS
 
 sub usage {
-    return "usage: $0 <tcpdump file>\n";
+    my $reason = join("", @_);
+    $reason .= "\n" if length($reason);
+    return "usage: $0 <tcpdump file>\n$reason";
 }
 
 sub bb {
