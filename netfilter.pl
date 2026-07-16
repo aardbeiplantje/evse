@@ -1,5 +1,342 @@
 #!/usr/bin/perl
 
+use strict;
+use warnings;
+
+use FindBin;
+use JSON::PP;
+
+my $xor_key = $ENV{XOR_KEY};
+my $where = $FindBin::Bin;
+
+# Determine input mode: pcap/tcpdump, trace, or raw websocket text
+my $input_file = $ARGV[0] // $ENV{NF_PKT_TRACE} // die "usage: $0 <file>";
+
+use Socket qw(AF_INET SOCK_RAW);
+use POSIX ();
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+use File::Basename qw(dirname);
+use File::Path qw(mkpath);
+use FindBin;
+
+use utils::netlink;
+
+my $st = {};
+open(my $rfh, '<', $input_file) or die $!;
+while(1){
+    local $/ = "\n";
+    my $h_msg = <$rfh>;
+    last unless ($h_msg//"") =~ m/^L:(\d+)\n/;
+    my $r = read($rfh, my $payload, $1)
+        // die $!;
+    last if $r == 0;
+    handle_data($st, $payload);
+}
+
+sub handle_data {
+    my ($self, $data) = @_;
+    return unless length($data//"");
+    # process the netlink/netfilter/queue message
+    eval {
+        my $st = \($self->{_nf_state} //= {});
+        logger::info("handling data:", to_hex($data));
+        netlink::handle_nlmsg(\$data, sub {
+            my ($ip_pkt_ref, $pkt_id, $m_seq) = @_;
+
+            # process IP packet
+            my $p_data = ip_packet::decode($ip_pkt_ref);
+            logger::info("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
+
+            # process IP packet data
+            handle_ip_data($st, $p_data, sub {
+                my ($buffer_ref) = @_;
+                # valid HTTP/WebSocket data
+                if($xor_key){
+                    # XOR decode
+                    logger::debug("xor_key: $xor_key");
+                    my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
+                    logger::info("decoded_msg: $decoded_msg");
+
+                    # JSON Parse
+                    $self->ocpp_msg_process($decoded_msg);
+                } else {
+                    logger::info("ocpp msg: $$buffer_ref");
+                    $self->ocpp_msg_process($$buffer_ref);
+                }
+                return;
+            });
+        });
+    };
+    if($@){
+        logger::log_error("problem handling data: $@");
+    }
+    return;
+}
+
+sub log_data {
+    my ($self, $msg) = @_;
+    open(my $of, '>>', '&STDOUT');
+    print {$of} $msg."\n";
+    return;
+}
+
+sub ocpp_msg_process {
+    my ($self, $msg) = @_;
+    eval {
+        # parse JSON + verify (simple)
+        require JSON;
+        my $ocpp_msg = JSON::decode_json($msg);
+        die "not a valid OCPP message: $msg"
+            unless ref($ocpp_msg) eq 'ARRAY' and scalar(@$ocpp_msg) >= 3;
+
+        # if this is an ocpp 1.6j message, let's check whether it's a start
+        # transaction, stop transaction or meter values message
+        my $meter_value;
+        if($ocpp_msg->[2] =~ m/^(MeterValues|StartTransaction|StopTransaction)$/ 
+                and ref($ocpp_msg->[3]) eq 'HASH'){
+            # get info from the message
+            my $st = $ocpp_msg->[3];
+            logger::debug("$ocpp_msg->[2] ", $st);
+            my $id_tag = $st->{idTag} // '';
+            my $connector_id = $st->{connectorId} // 0;
+
+            # get the metervalue from a udp/uart rs485 modbus call to an
+            # eastron SDM630, format:
+            #   ...,eastron:sdm630:totalkwh*kWh,1968.61193847656
+            #
+            my $m_value = `LOGGER_STDERR=0 perl $FindBin::Bin/modbus.pl tcp://192.168.1.252:4196=1:Eastron::SDM630::TotalKWh`;
+            if($?){
+                logger::error("modbus.pl failed: $m_value");
+                $m_value = '';
+            }
+            if(length($m_value)){
+                chomp($m_value);
+                logger::debug("modbus value: $m_value");
+                if($m_value =~ s{.*totalkwh\*kWh,}{}){
+                    if($m_value =~ m{^(\d+(\.\d+)?)$}){
+                        $meter_value = $1;
+                        logger::info("OCPP $ocpp_msg->[2] sdm630_meter_value=$meter_value");
+                    } else {
+                        logger::error("modbus value does not match expected format: $m_value");
+                    }
+                } else {
+                    logger::error("modbus value does not match expected format: $m_value");
+                }
+
+            }
+        } else {
+            logger::debug("not a StartTransaction/StopTransaction/MeterValues message");
+        }
+
+        # make audit log
+        if(defined $meter_value){
+            $self->log_data("$msg,$meter_value");
+        } else {
+            $self->log_data($msg);
+        }
+
+        # cool charging bool flag per idTag
+        eval {
+            my $idTag = $ocpp_msg->[3]{idTag};
+            if      ($ocpp_msg->[2] eq "StartTransaction"){
+            } elsif ($ocpp_msg->[2] eq "StopTransaction"){
+            }
+        };
+        if($@){
+            logger::error("problem logging blinkcharging metric: $@");
+        }
+    };
+    if($@){
+        logger::error("problem processing $msg: $@");
+    }
+    return;
+}
+
+sub handle_ip_data {
+    my ($state, $pkt, $h_sub) = @_;
+    return unless defined $pkt and defined $pkt->{conn};
+    my $_st = $$state //= {};
+    logger::debug("handle payload");
+
+    my $conn_k1 = join(",", @{$pkt->{conn}});
+    my $conn_k2 = join(",", reverse @{$pkt->{conn}});
+
+    # if we get a TCP_FIN, we should close the connection and cleanup
+    if(defined $pkt->{tcp_flags}){
+        if($pkt->{tcp_flags} & 0x01){
+            logger::debug("TCP_FIN for ".join(",", @{$pkt->{conn}}));
+            delete $_st->{$conn_k1};
+            delete $_st->{$conn_k2};
+            return;
+        }
+        if($pkt->{tcp_flags} & 0x02 and   $pkt->{tcp_flags} & 0x10){
+            logger::debug("TCP_SYN ACK for ".join(",", @{$pkt->{conn}}));
+        }
+        if($pkt->{tcp_flags} & 0x02 and !($pkt->{tcp_flags} & 0x10)){
+            logger::debug("TCP_SYN for ".join(",", @{$pkt->{conn}}));
+        }
+    }
+    return unless defined $pkt and defined $pkt->{conn} and length($pkt->{data}//"");
+    my $data_payload = $pkt->{data};
+    my $st  =
+            $_st->{$conn_k1} 
+        //= $_st->{$conn_k2}
+        //= {};
+    $st->{buf} //= "";
+    $st->{buf} .= $data_payload;
+    my $buf = \$st->{buf};
+    logger::debug("DATA:>>$$buf<<LENGTH:".length($$buf));
+
+    # was this a HTTP request? client -> server
+    my $req = $$buf =~ s{.*?(GET|POST|PUT|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s(.*?)\sHTTP/1\.\d\r\n(.*?)\r\n\r\n}{}ms;
+    if($req){
+        logger::debug("HTTP Request");
+        logger::debug(" - method: $1");
+        logger::debug(" - uri: $2");
+        logger::debug(" - headers: $3");
+        $$buf = "";
+        delete $_st->{$conn_k1};
+        delete $_st->{$conn_k2};
+        return;
+    }
+
+    # was this a HTTP response? server -> client
+    my $res = $st->{buf} =~ s{.*?HTTP/1\.\d\s(\d+)\s(.*?)\r\n(.*?)\r\n\r\n}{}ms;
+    if($res){
+        logger::debug("HTTP Response");
+        logger::debug(" - status: $1");
+        logger::debug(" - reason: $2");
+        logger::debug(" - headers: $3");
+        # let's parse the headers for Content-Length
+        my $content_length = $3 =~ m{Content-Length:\s(\d+)}m;
+        logger::debug(" - content_length: $content_length");
+        # let's throw away the response body for now
+        substr($$buf, 0, $content_length, '') if $content_length;
+        if(length($$buf) > 0){
+            logger::debug(" - remaining: ".length($$buf));
+            logger::debug(" - remaining[hex]: ".to_hex($$buf));
+        }
+        delete $_st->{$conn_k1};
+        delete $_st->{$conn_k2};
+        return;
+    }
+
+    # is this a websocket frame?
+    my $wsbuf = \($st->{wsbuf} //= "");
+    logger::debug("check WEBSOCKET, $pkt->{conn}");
+    while(length($$buf//"") > 1){
+        logger::debug("buf: ".to_hex($$buf));
+        my $frame_st = substr($$buf, 0, 1, '');
+        logger::debug("frame header 1: ".to_hex($frame_st));
+        my $fin_opcode = unpack("C", $frame_st);
+        my $fin    = ($fin_opcode>>7) & 0x1;
+        my $opcode = $fin_opcode & 0x0f;
+        if($opcode == 0x01){
+            logger::debug("text frame");
+        } elsif($opcode == 0x02){
+            logger::debug("binary frame");
+        } elsif($opcode == 0x08){
+            logger::debug("close frame");
+        } elsif($opcode == 0x09){
+            logger::debug("ping frame");
+        } elsif($opcode == 0x0a){
+            logger::debug("pong frame");
+        } elsif($opcode == 0x00){
+            logger::debug("non-first frame of fragmented message");
+        } else {
+            logger::debug("probably not websocket, opcode: ".to_hex(pack("C", $opcode)));
+            return;
+        }
+        if(!length($$buf)){
+            logger::debug("buffer empty");
+            last;
+        }
+        $frame_st = substr($$buf, 0, 1, '');
+        logger::debug("frame header 2: ".to_hex($frame_st));
+        my $payload_len = unpack("C", $frame_st);
+        my $masked = ($payload_len>>7) & 0x1;
+        $payload_len &= 0x7f;
+        if($payload_len == 126){
+            $payload_len = unpack("S>", substr($$buf, 2, 2, ''));
+            return unless defined $payload_len;
+        } elsif($payload_len == 127){
+            $payload_len = unpack("Q>", substr($$buf, 2, 8, ''));
+            return unless defined $payload_len;
+        } else {
+        }
+        logger::debug("fin: $fin, opcode: $opcode, mask: $masked, payload_len: $payload_len");
+        my $mask_key;
+        if($masked){
+            $mask_key = substr($$buf, 0, 4, '');
+        }
+        my $masked_data = substr($$buf, 0, $payload_len, '');
+        if(length($masked_data) < $payload_len){
+            logger::debug("incomplete frame");
+            return;
+        }
+        logger::debug("got data, size:".length($masked_data));
+        if($opcode == 0x08){
+            logger::debug("close frame");
+            if(length($masked_data)){
+                my $close_code = unpack("S>", substr($masked_data, 0, 2, ''));
+                logger::debug("close_code: $close_code");
+                my $close_reason = substr($masked_data, 0, length($masked_data), '');
+                logger::debug("close_reason: $close_reason");
+            }
+            $$wsbuf = "";
+            last;
+        }
+        if($masked and length($mask_key) >= 4){
+            logger::debug("mask_key: ".to_hex($mask_key));
+            logger::debug("masked_data: ".to_hex($masked_data));
+            $masked_data ^= substr(($mask_key x (int(length($masked_data)/length($mask_key))+1)), 0, length($masked_data));
+            logger::debug("unmask_data: ".to_hex($masked_data));
+        } else {
+            logger::debug("unmask_data: ".to_hex($masked_data));
+        }
+        if($fin == 0x01){
+            $$wsbuf .= $masked_data;
+            logger::debug("final frame");
+            if($opcode == 0x02 or $opcode == 0x01){
+                logger::debug("final binary frame");
+                $h_sub //= sub {
+                    my ($buffer_ref) = @_;
+                    print $$buffer_ref."\n";
+                    return;
+                };
+                &{$h_sub}($wsbuf, $pkt);
+            } else {
+                logger::debug("final frame");
+                if($opcode == 0x0a or $opcode == 0x09){
+                    logger::debug("ping/pong frame, payload for ping/pong: $masked_data");
+                } else {
+                    print $$wsbuf."\n";
+                }
+            }
+            $$wsbuf = "";
+        } else {
+            if($opcode == 0x02 or $opcode == 0x01){
+                logger::debug("continuation binary frame");
+                $$wsbuf .= $masked_data;
+            } else {
+                logger::debug("continuation frame");
+            }
+        }
+    }
+    return;
+}
+
+sub to_hex {
+    my $b = \$_[0];
+    return join("",map {sprintf("%02x", ord $_)} split '', $$b//"");
+}
+
+sub xor_msg {
+    my ($s_key8, $m) = @_;
+    my $fs_key8 = substr(($s_key8) x (int(length($m)/length($s_key8))+1), 0, length($m));
+    return $m ^ $fs_key8;
+}
+
 # ===========================================================================
 # Inline logger - replaces utils::logger
 # ===========================================================================
@@ -7,9 +344,10 @@ package logger;
 use strict;
 use warnings;
 
+no warnings 'redefine';
+
 our $_log_level;
 our $_logger_stderr;
-our $DEFAULT_LOGLEVEL = "info";
 
 sub _cfg {
     my ($k, $default) = @_;
@@ -26,21 +364,21 @@ sub log_fatal {
 
 sub log_error {
     my (@msg) = @_;
-    return unless _cfg("logger_level", $DEFAULT_LOGLEVEL) =~ /^(error|info|debug)$/
+    return unless _cfg("logger_level", 'info') =~ /^(error|info|debug)$/
                  || _cfg("DEBUG", 0);
     print STDERR "[ERROR] " . join(" ", @msg) . "\n";
 }
 
 sub log_info {
     my (@msg) = @_;
-    return unless _cfg("logger_level", $DEFAULT_LOGLEVEL) =~ /^(info|debug)$/
+    return unless _cfg("logger_level", 'info') =~ /^(info|debug)$/
                  || _cfg("DEBUG", 0);
     print STDERR "[INFO] " . join(" ", @msg) . "\n";
 }
 
 sub log_debug {
     my (@msg) = @_;
-    return unless _cfg("logger_level", $DEFAULT_LOGLEVEL) =~ /^(debug)$/
+    return unless _cfg("logger_level", 'info') =~ /^(debug)$/
                  || _cfg("DEBUG", 0);
     no warnings 'once';
     require Data::Dumper;
@@ -52,9 +390,7 @@ sub log_debug {
 }
 
 # Aliases used by original logger
-{ no warnings 'once'; *fatal = *log_fatal; *error = *log_error; *info = *log_info; *debug = *log_debug; }
-
-1;
+BEGIN { no warnings 'once'; *fatal = *log_fatal; *error = *log_error; *info = *log_info; *debug = *log_debug; }
 
 # ===========================================================================
 # Inline cfg - replaces utils::cfg
@@ -63,235 +399,12 @@ package utils;
 use strict;
 use warnings;
 
+no warnings 'redefine';
+
 sub cfg {
     my ($k, $default, $nm, $do_exception, $r) = @_;
     my $env_m = uc("NETFILTER_$k");
     my $env_a = uc("XOR_$k");
     my $v = $ENV{$env_m} // $ENV{$env_a} // $default;
     return $v;
-}
-
-1;
-
-# ===========================================================================
-# Main script
-# ===========================================================================
-package main;
-use strict;
-use warnings;
-
-use FindBin qw($Bin);
-use JSON::PP;
-
-my $xor_key = $ENV{XOR_KEY};
-my $where = $Bin;
-
-# Determine input mode: pcap/tcpdump, trace, or raw websocket text
-my $input_file = $ARGV[0] // $ENV{NF_PKT_TRACE} // "nf_pkt.trace";
-my @packets;
-
-if ($input_file =~ /\.(tcpdump|pcap|pcapng)$/i) {
-    # pcap/tcpdump file - extract WebSocket text via tshark
-    my $ws_lua = "$where/ws.lua";
-    if ($xor_key) {
-        # Encrypted: use ws.lua with XOR key
-        open(my $t, "tshark -r $input_file -X lua_script1:$xor_key -X lua_script:$ws_lua -T fields -e bcencrypt.hex 2>/dev/null|grep --line-buffered .|")
-            or die "Cannot run tshark: $!\n";
-        while (my $l = <$t>) {
-            chomp($l);
-            next unless length($l);
-            $l =~ s/(..)/pack("C", hex($1))/ge;
-            push @packets, $l;
-        }
-        close($t);
-    } else {
-        # Plaintext: use built-in websocket payload text
-        open(my $t, "tshark -r $input_file -Y websocket -T fields -e websocket.payload.text 2>/dev/null|grep --line-buffered .|")
-            or die "Cannot run tshark: $!\n";
-        while (my $l = <$t>) {
-            chomp($l);
-            next unless length($l);
-            push @packets, $l;
-        }
-        close($t);
-    }
-    logger::info("Read " . scalar(@packets) . " websocket packets from $input_file");
-} else {
-    # Trace file: format is "L:<LENGTH>\n<DATA>" per packet
-    # Each packet starts with a line like "L:12345" followed by exactly 12345 bytes of data
-    open(my $fh, '<', $input_file) or die "Cannot open $input_file: $!\n";
-    while (my $line = <$fh>) {
-        chomp($line);
-        next unless $line =~ /^L:(\d+)$/;
-        my $len = $1;
-        next unless $len > 0;
-        my $data = '';
-        my $got = 0;
-        while ($got < $len) {
-            my $ch = getc($fh);
-            last unless defined $ch;
-            $data .= $ch;
-            $got++;
-        }
-        push @packets, $data if $got == $len;
-    }
-    close($fh);
-    logger::info("Read " . scalar(@packets) . " packets from $input_file");
-}
-
-my $bc_state = {};
-no warnings 'once';
-my $st = {};
-
-foreach my $raw_data (@packets) {
-    # Feed raw TCP payload directly into handle_payload
-    my $pkt = { data => $raw_data, conn => ['local', 'remote'] };
-    handle_payload($st, $pkt, sub {
-        my ($buffer_ref, $pkt) = @_;
-        if ($xor_key) {
-            handle_bc_payload($bc_state, $buffer_ref, $xor_key);
-        } else {
-            print $$buffer_ref;
-            print STDERR join("->", @{$pkt->{conn}}) . ">>DATA>>$$buffer_ref<<\n";
-            $$buffer_ref = "";
-        }
-        return;
-    });
-}
-
-sub xor_msg {
-    my ($s_key8, $m) = @_;
-    my $fs_key8 = substr(($s_key8) x (int(length($m) / length($s_key8)) + 1), 0, length($m));
-    return $m ^ $fs_key8;
-}
-
-sub handle_bc_payload {
-    my ($state, $buffer_ref, $xor_key) = @_;
-    my $decoded_msg = xor_msg($xor_key, $$buffer_ref);
-    my $m;
-    eval {
-        $m = JSON::PP::decode_json($decoded_msg);
-    };
-    if ($@) {
-        $m = undef;
-    } else {
-        if (!defined $m or ref($m) ne 'ARRAY') {
-            $m = undef;
-        }
-    }
-    my $power_used;
-    my $meter_value = '';
-    if ($m) {
-        # this is an ocpp 1.6j message, let's check whether it's a start transaction
-        if ($m->[2] =~ m/^(MeterValues|StartTransaction|StopTransaction)$/ and ref($m->[3]) eq 'HASH') {
-            # get info from the message
-            my $st = $m->[3];
-            my $id_tag = $st->{idTag} // '';
-            my $connector_id = $st->{connectorId} // 0;
-
-            # get the metervalue from a udp/uart rs485 modbus call to an eastron SDM630, format:
-            #   2025-05-31 22:45:23.652492,eastron:sdm630:totalkwh*kWh,1968.61193847656
-            my $m_value = `LOGGER_STDERR=0 perl modbus.pl tcp://192.168.1.252:4196=1:Eastron::SDM630::TotalKWh`;
-            if ($?) {
-                $m_value = '';
-            }
-            if (length($m_value)) {
-                chomp($m_value);
-                if ($m_value =~ s{.*totalkwh\*kWh,}{}) {
-                    if ($m_value =~ m{^(\d+(\.\d+)?)$}) {
-                        $meter_value = $1;
-                        my $power_cnt = \($state->{$id_tag . "/" . $connector_id} //= 0);
-                        if ($m->[2] eq 'StartTransaction') {
-                            $$power_cnt = $meter_value;
-                            $power_used = 0;
-                        }
-                        if ($m->[2] eq 'StopTransaction') {
-                            $power_used = $meter_value - $$power_cnt;
-                        }
-                        if ($m->[2] eq 'MeterValues') {
-                            $power_used = $meter_value;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (defined $power_used) {
-        print "$decoded_msg,$meter_value,$power_used\n";
-    } else {
-        print "$decoded_msg\n";
-    }
-    return;
-}
-
-sub handle_payload {
-    my ($state, $pkt, $h_sub) = @_;
-    return unless defined $pkt and defined $pkt->{data} and length($pkt->{data} // "");
-    my $data_payload = $pkt->{data};
-    my $conn_k1 = join(",", @{$pkt->{conn} // ['unknown']});
-    my $conn_k2 = join(",", reverse @{$pkt->{conn} // ['unknown']});
-    my $st = $state->{$conn_k1} //= $state->{$conn_k2} //= {};
-    $st->{buf} //= "";
-    $st->{buf} .= $data_payload;
-    my $buf = \$st->{buf};
-
-    # WebSocket frame parsing - peek first, only consume if valid
-    my $wsbuf = \($st->{wsbuf} //= "");
-    while (length($$buf // "") >= 2) {
-        # Peek first byte to check opcode
-        my $fin_opcode = unpack("C", substr($$buf, 0, 1));
-        my $fin = ($fin_opcode >> 7) & 0x1;
-        my $opcode = $fin_opcode & 0x0f;
-        # accept only valid websocket opcodes
-        last unless $opcode == 0x00 or $opcode == 0x01 or $opcode == 0x02
-                 or $opcode == 0x08 or $opcode == 0x09 or $opcode == 0x0a;
-        # Now consume frame header bytes
-        substr($$buf, 0, 1, '');  # FIN+opcode
-        my $payload_len = unpack("C", substr($$buf, 0, 1, ''));  # payload length byte
-        my $masked = ($payload_len >> 7) & 0x1;
-        $payload_len &= 0x7f;
-        if ($payload_len == 126) {
-            $payload_len = unpack("S>", substr($$buf, 2, 2, ''));
-            return unless defined $payload_len;
-        } elsif ($payload_len == 127) {
-            $payload_len = unpack("Q>", substr($$buf, 2, 8, ''));
-            return unless defined $payload_len;
-        }
-        my $mask_key;
-        if ($masked) {
-            $mask_key = substr($$buf, 0, 4, '');
-        }
-        my $masked_data = substr($$buf, 0, $payload_len, '');
-        if (length($masked_data) < $payload_len) {
-            return;
-        }
-        if ($opcode == 0x08) {
-            $$wsbuf = "";
-            last;
-        }
-        if ($masked and length($mask_key) >= 4) {
-            $masked_data ^= substr(($mask_key x (int(length($masked_data) / length($mask_key)) + 1)), 0, length($masked_data));
-        }
-        if ($fin == 0x01) {
-            $$wsbuf .= $masked_data;
-            if ($opcode == 0x02 or $opcode == 0x01) {
-                &{$h_sub}($wsbuf, $pkt);
-            } else {
-                print $$wsbuf . "\n" if $opcode != 0x0a and $opcode != 0x09;
-            }
-            $$wsbuf = "";
-        } else {
-            $$wsbuf .= $masked_data if $opcode == 0x02 or $opcode == 0x01;
-        }
-    }
-    if (length($$buf)) {
-        $h_sub //= sub {
-            my ($buffer_ref) = @_;
-            print $$buffer_ref . "\n";
-            $$buffer_ref = "";
-            return;
-        };
-        &{$h_sub}($buf, $pkt);
-    }
-    return;
 }
