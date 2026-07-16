@@ -9,8 +9,9 @@ use JSON::PP;
 my $xor_key = $ENV{XOR_KEY};
 my $where = $FindBin::Bin;
 
-# Determine input mode: pcap/tcpdump, trace, or raw websocket text
+# Determine input mode: pcap/tcpdump or trace (L:<LEN>\n<DATA>)
 my $input_file = $ARGV[0] // $ENV{NF_PKT_TRACE} // die "usage: $0 <file>";
+my $nf_input   = $ENV{NF_INPUT} // 'pcap';  # 'pcap' (default) or 'trace'
 
 use Socket qw(AF_INET SOCK_RAW);
 use POSIX ();
@@ -25,21 +26,74 @@ use utils::pcap;
 
 my $sf = {};
 my $st = \($sf->{_nf_state} //= {});
-open(my $rfh, '<', $input_file) or die $!;
-while(1){
-    local $/ = "\n";
-    my $h_msg = <$rfh>;
-    last unless ($h_msg//"") =~ m/^L:(\d+)\n/;
-    my $r = read($rfh, my $payload, $1)
-        // die $!;
-    last if $r == 0;
-    handle_frame($sf, $st, \$payload);
+
+if($nf_input eq 'trace') {
+    # trace format: L:<LENGTH>\n<DATA> per packet
+    open(my $rfh, '<', $input_file) or die $!;
+    while(1){
+        local $/ = "\n";
+        my $h_msg = <$rfh>;
+        last unless ($h_msg//"") =~ m/^L:(\d+)\n/;
+        my $r = read($rfh, my $payload, $1)
+            // die $!;
+        last if $r == 0;
+        handle_frame($sf, $st, \$payload);
+    }
+    close($rfh);
+
+} else {
+    # pcap/tcpdump format: stream-read, advance file pointer
+    # PCAP global header is 24 bytes; detect byte order from magic number
+    # then each record is 16-byte hdr + incl_len bytes of packet data
+    open(my $pfh, '<:raw', $input_file) or die $!;
+
+    # Read global header (24 bytes) once
+    my $ghdr;
+    read($pfh, $ghdr, 24) or die "pcap: short global header";
+
+    # Detect byte order from pcap magic: 0xa1b2c3d4 = native, 0xd4c3b2a1 = swapped
+    my $magic = unpack("V", $ghdr);  # little-endian probe
+    my $be    = ($magic == 0xd4c3b2a1) ? 1 : 0;  # 1 => big-endian fields
+    my $fmt   = $be ? "NNNN" : "LLLL";
+
+    # Stream through pcap records
+    while(1) {
+        # Record header: ts_sec(4) ts_usec(4) incl_len(4) orig_len(4)
+        my $rec_hdr;
+        my $r = read($pfh, $rec_hdr, 16);
+        last unless defined $r && $r == 16;
+        my ($ts_sec, $ts_usec, $incl_len, $orig_len) = unpack($fmt, $rec_hdr);
+
+        # incl_len includes Ethernet header (14 bytes);
+        # read full frame data so pointer advances regardless of type
+        my $ethhdr;
+        my $frame_data;
+        my $data_len = $incl_len;
+        $r = read($pfh, $ethhdr, 14);
+        last unless defined $r && $r == 14;
+        my ($eth_dst, $eth_src, $eth_type) = unpack("a6a6S>", $ethhdr);
+
+        # skip non-IPv4 packets by reading their data and moving on
+        if ($eth_type != 0x0800) {
+            $r = read($pfh, $frame_data, $data_len - 14);
+            last unless defined $r && $r == ($data_len - 14);
+            next;
+        }
+
+        my $ip_len = $incl_len - 14;
+        my $ip_data;
+        $r = read($pfh, $ip_data, $ip_len);
+        last unless defined $r && $r == $ip_len;
+
+        handle_frame($sf, $st, \$ip_data);
+    }
+    close($pfh);
 }
 
 sub handle_frame {
     my ($self, $st, $ip_pkt_ref) = @_;
     my $p_data = ip_packet::decode($ip_pkt_ref);
-    logger::info("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
+    logger::debug("payload", length($p_data->{data}//"")?to_hex($p_data->{data}):"");
     # process IP packet data
     handle_ip_data($st, $p_data, sub {
         my ($buffer_ref) = @_;
@@ -53,7 +107,7 @@ sub handle_frame {
             # JSON Parse
             ocpp_msg_process($self, $decoded_msg);
         } else {
-            logger::info("ocpp msg: $$buffer_ref");
+            logger::debug("ocpp msg: $$buffer_ref");
             ocpp_msg_process($self, $$buffer_ref);
         }
         return;
@@ -117,9 +171,9 @@ sub ocpp_msg_process {
 
         # make audit log
         if(defined $meter_value){
-            $self->log_data("$msg,$meter_value");
+            print "$msg,$meter_value\n";
         } else {
-            $self->log_data($msg);
+            print "$msg\n";
         }
 
         # cool charging bool flag per idTag
@@ -141,9 +195,10 @@ sub ocpp_msg_process {
 
 sub handle_ip_data {
     my ($state, $pkt, $h_sub) = @_;
+    logger::debug("handle payload?");
     return unless defined $pkt and defined $pkt->{conn};
     my $_st = $$state //= {};
-    logger::debug("handle payload");
+    logger::debug("handle payload: yes");
 
     my $conn_k1 = join(",", @{$pkt->{conn}});
     my $conn_k2 = join(",", reverse @{$pkt->{conn}});

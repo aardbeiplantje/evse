@@ -166,7 +166,7 @@ sub decode {
     } else {
         logger::debug(" - unknown ipproto: $ipproto");
     }
-    $pkt->{conn} = ["$sip:$sport", "$dip:$dport"]
+    $pkt->{conn} = ["$sip:".($sport//0), "$dip:".($dport//0)]
         if $sip // $dip // $sport // $dport // 0;
     return $pkt;
 }
