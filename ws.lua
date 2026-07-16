@@ -1,4 +1,3 @@
-require "bit32"
 require "string"
 
 local args = { ... }
@@ -17,7 +16,7 @@ local function xorf(data)
       v = tbl_xor_key:byte(j)
       j = j +1
       --print("L:"..tostring(l)..",I:"..tostring(i)..",J:"..tostring(j)..",V:"..tostring(v))
-      s = string.format("%c", bit32.bxor(str:byte(i), v))
+      s = string.format("%c", str:byte(i) ~ v)
       table.insert(d, s)
     end
 
