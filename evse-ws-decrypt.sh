@@ -19,6 +19,6 @@ tshark -r "$sfn" -2 -R \
     -e ip.dst \
     -e text \
     -e _ws.col.Info \
-    -e bcencrypt.command \
+    -e bcencrypt.command 2>/dev/null \
     |awk -F'\t' '{print $6}' \
     |grep -v '^ *$'
