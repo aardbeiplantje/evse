@@ -3,13 +3,13 @@ sfn=$1
 shift
 kfn=$1
 shift
-[[ ! -f "$sfn" ]] && { echo "usage: $BASH_SOURCE <tcpdumpfile> [<keyfile>]"; exit 1; }
-where=$(readlink -f ${BASH_SOURCE})
+[[ ! -f "$sfn" ]] \
+    && { echo "usage: $BASH_SOURCE <tcpdumpfile> [<keyfile>]"; exit 1; }
+where=$(readlink -f "${BASH_SOURCE}")
 websocket_lua_script_file=${where%/*}/ws.lua
 tshark -r "$sfn" -2 -R \
     'tcp and (not tcp.len==0) and (websocket || http)' \
-    $([ -f "$kfn" ] && echo "\
-    -X lua_script1:$(cat $kfn)")\
+    $([ -f "$kfn" ] && echo "-X lua_script1:$(cat $kfn)") \
     -X lua_script:$websocket_lua_script_file \
     -T fields \
     -E occurrence=l \
@@ -21,5 +21,4 @@ tshark -r "$sfn" -2 -R \
     -e _ws.col.Info \
     -e bcencrypt.command \
     |awk -F'\t' '{print $6}' \
-    |sed 's/ //g' \
-    |grep -v '^$'
+    |grep -v '^ *$'
