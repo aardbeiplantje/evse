@@ -76,7 +76,7 @@ local function do_ws_bcencrypt(tvb, pinfo, root)
         --print("STR:"..da)
         subtree:add(f_command, da)
     else
-        --print("STR:"..da)
+        subtree:add(f_command, tvb:raw())
     end
 
     --print("END")
